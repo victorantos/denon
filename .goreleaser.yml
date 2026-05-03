@@ -1,0 +1,41 @@
+version: 2
+
+project_name: denon
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: denon
+    main: ./cmd/denon
+    binary: denon
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos: [darwin, linux, windows]
+    goarch: [amd64, arm64]
+
+# Public installer expects raw binaries named denon-<os>-<arch>, not the
+# default tar.gz archives — keeps install.sh trivial (single curl).
+archives:
+  - format: binary
+    name_template: '{{ .Binary }}-{{ .Os }}-{{ .Arch }}'
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  draft: false
+  prerelease: auto
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
