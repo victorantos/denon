@@ -1,5 +1,7 @@
 # denon
 
+> 📖 **The story:** [I Bought a Denon for My Wedding. Twelve Years Later, I Vibe-Coded Its Radio Back to Life.](https://victorantos.com/posts/i-bought-a-denon-for-my-wedding-then-i-vibe-coded-its-radio-back/)
+
 A self-hosted replacement for the discontinued **vTuner** internet-radio directory baked into Denon, Marantz, Yamaha, Onkyo, and Pioneer AVRs from roughly 2011 to 2017.
 
 If your receiver's "Internet Radio" menu went silent — empty list, "service unavailable," or a vTuner ad about a $3/year subscription — this brings it back. Your hardware was never broken; the directory server it phoned home to was retired. We host one on your LAN instead.
