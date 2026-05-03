@@ -61,6 +61,23 @@ Confirmed model paths covered by the default DNS intercepts:
 
 If your receiver hits a hostname not in the default list, add it with `-dns-intercept`. Open an issue with `tcpdump -i any port 53` from your network — happy to expand the defaults.
 
+## Older receivers stuck in "vTuner unavailable" state
+
+Some receivers (verified on the Denon AVR-X3000) have been sitting for years with vTuner reachable-but-empty, and their firmware has cached a "service unavailable" state. The on-screen Internet Radio menu in that state shows **only the local Favorites list** — no Most Popular, no Genres, no Search. Pressing Internet Radio doesn't trigger a fresh directory fetch.
+
+This service handles that case by:
+
+1. **Stream proxy on `/play`** — converts radio-browser's HTTPS streams to plain HTTP for receivers that can't do TLS (most pre-2017 hardware can't follow HTTPS redirects on the playback path).
+2. **Legacy-favorites handler on `/setupapp/<vendor>/asp/func/dynamOD.asp`** — catches the receiver's "play this saved-Favorite ID" requests, hashes the cached numeric ID into a list of currently-popular HTTP MP3 stations, and proxies whichever station that hash picks. Same Favorite always plays the same station; different Favorites play different stations.
+
+The receiver's *display* will still show the labels saved years ago ("BBC Radio 2 live", "Sky.fm Compact Discoveries", whatever) because those labels live in the receiver's NVRAM. The audio underneath each label is whatever popular station the hash picked.
+
+**Workaround for live menu browsing on stuck receivers:** every Denon and Marantz of this era shipped with a hidden web UI at `http://<receiver-ip>/NetAudio/index.html`. The "Search by Keyword" field there triggers a live search request through us against radio-browser, returning playable results. Useful when the on-screen menu refuses to update.
+
+A **Network Settings reset** on the receiver (Setup → General → Reset → Network Settings; *not* Default Settings) sometimes unsticks the on-screen menu without a firmware update — at the cost of having to re-enter your static IP/DNS config. Worth trying before you give up on the on-screen menu.
+
+**Don't update firmware** to fix this. Denon discontinued AVR-X3000 firmware updates in mid-2023, and even the final 2023 firmware doesn't have logic to handle the stuck-vTuner case (Denon never wrote it). Updating buys nothing and risks bricking.
+
 ## Configuration
 
 Everything is flags. The installer picks sensible defaults; pass them yourself if you want to.

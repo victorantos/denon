@@ -1,11 +1,16 @@
 package vtuner
 
 import (
+	"context"
 	"encoding/xml"
+	"hash/fnv"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"time"
 
 	"denon/internal/radiobrowser"
 )
@@ -19,6 +24,14 @@ type Server struct {
 	BaseURL string // public URL receivers reach us at, e.g. "http://192.168.1.10"
 	Logger  *slog.Logger
 	Radio   *radiobrowser.Client
+
+	// Cache of HTTP-only popular stations used as legacy-favorite fallbacks.
+	// Each unique cached vTuner ID gets stably hashed into this list so the
+	// same Favorite always plays the same station, but different Favorites
+	// play different stations.
+	legacyMu       sync.Mutex
+	legacyStations []radiobrowser.Station
+	legacyExpires  time.Time
 }
 
 func (s *Server) Routes() http.Handler {
@@ -61,11 +74,82 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	writeXML(w, page)
 }
 
-// handleSetupApp catches the hardcoded vTuner endpoint the receiver hits
-// first, e.g. /setupapp/Denon/asp/BrowseXML/loginXML.asp. Path fragments
-// differ per brand; the response shape is identical so we funnel into root.
+// handleSetupApp catches every /setupapp/* request the receiver makes. The
+// receiver uses two distinct subpaths: BrowseXML/* for directory navigation,
+// and asp/func/dynamOD.asp for legacy-favorites playback. We dispatch
+// accordingly.
 func (s *Server) handleSetupApp(w http.ResponseWriter, r *http.Request) {
+	if strings.Contains(r.URL.Path, "/asp/func/dynamOD.asp") {
+		s.handleLegacyPlay(w, r)
+		return
+	}
 	s.handleRoot(w, r)
+}
+
+// handleLegacyPlay answers /setupapp/<vendor>/asp/func/dynamOD.asp. These
+// requests carry pre-shutdown numeric vTuner station IDs from the receiver's
+// cached Favorites list. We don't have the original mapping from those IDs
+// to current stations, so we hash each ID into a list of popular HTTP-only
+// stations and play that one — different Favorites get different stations,
+// and the same Favorite plays the same station consistently across taps.
+func (s *Server) handleLegacyPlay(w http.ResponseWriter, r *http.Request) {
+	stations, err := s.legacyFallbacks(r.Context())
+	if err != nil || len(stations) == 0 {
+		http.Error(w, "no fallback stations available", http.StatusBadGateway)
+		return
+	}
+	id := r.URL.Query().Get("id")
+	idx := stableIdx(id, len(stations))
+	chosen := stations[idx]
+	streamURL := chosen.URLResolved
+	if streamURL == "" {
+		streamURL = chosen.URL
+	}
+	s.Logger.Info("legacy play", "id", id, "idx", idx, "station", chosen.Name, "stream", streamURL)
+	s.proxyStream(w, r, streamURL)
+}
+
+// legacyFallbacks returns a cached list of popular HTTP-only stations. We
+// prefer plain-HTTP because the receiver itself can't follow HTTPS; the
+// proxy works regardless, but HTTP-only is a tiny optimization. Cached for
+// an hour because mirror discovery and station refresh are not free.
+func (s *Server) legacyFallbacks(ctx context.Context) ([]radiobrowser.Station, error) {
+	s.legacyMu.Lock()
+	defer s.legacyMu.Unlock()
+	if len(s.legacyStations) > 0 && time.Now().Before(s.legacyExpires) {
+		return s.legacyStations, nil
+	}
+	stations, err := s.Radio.TopVote(ctx, 200)
+	if err != nil {
+		return nil, err
+	}
+	httpOnly := make([]radiobrowser.Station, 0, len(stations))
+	for _, st := range stations {
+		u := st.URLResolved
+		if u == "" {
+			u = st.URL
+		}
+		if strings.HasPrefix(u, "http://") {
+			httpOnly = append(httpOnly, st)
+		}
+	}
+	if len(httpOnly) == 0 {
+		httpOnly = stations
+	}
+	s.legacyStations = httpOnly
+	s.legacyExpires = time.Now().Add(time.Hour)
+	return httpOnly, nil
+}
+
+// stableIdx maps an arbitrary string to [0,n) deterministically — same input
+// always yields the same index.
+func stableIdx(s string, n int) int {
+	if n <= 0 {
+		return 0
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(s))
+	return int(h.Sum32() % uint32(n))
 }
 
 func (s *Server) handleRBRoot(w http.ResponseWriter, r *http.Request) {
@@ -199,7 +283,43 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "stream unavailable", http.StatusBadGateway)
 		return
 	}
-	http.Redirect(w, r, stream, http.StatusFound)
+	s.proxyStream(w, r, stream)
+}
+
+// proxyStream pipes audio bytes from the upstream URL back to the receiver
+// over plain HTTP. Older AVRs (e.g. AVR-X3000) cannot follow HTTPS
+// redirects or do TLS at all on the playback path, so we terminate TLS
+// here and hand them clean HTTP. ICY metadata is forwarded so receivers
+// that show track titles still get them.
+func (s *Server) proxyStream(w http.ResponseWriter, r *http.Request, upstreamURL string) {
+	upReq, err := http.NewRequestWithContext(r.Context(), "GET", upstreamURL, nil)
+	if err != nil {
+		http.Error(w, "bad upstream url", http.StatusInternalServerError)
+		return
+	}
+	if v := r.Header.Get("Icy-MetaData"); v != "" {
+		upReq.Header.Set("Icy-MetaData", v)
+	}
+	upReq.Header.Set("User-Agent", "denon/0.1 (proxy)")
+
+	resp, err := http.DefaultClient.Do(upReq)
+	if err != nil {
+		s.Logger.Error("proxy upstream", "url", upstreamURL, "err", err)
+		http.Error(w, "upstream unavailable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, vs := range resp.Header {
+		lk := strings.ToLower(k)
+		if lk == "content-type" || strings.HasPrefix(lk, "icy-") {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
 }
 
 func (s *Server) writeStations(w http.ResponseWriter, title, backPath string, stations []radiobrowser.Station) {
