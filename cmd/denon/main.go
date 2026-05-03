@@ -29,6 +29,9 @@ func main() {
 		upstream  = flag.String("dns-upstream", "1.1.1.1:53,9.9.9.9:53", "Comma-separated upstream DNS forwarders.")
 		intercept = flag.String("dns-intercept", strings.Join(dnsserver.DefaultInterceptDomains, ","), "Comma-separated hostname suffixes to intercept.")
 		ifaceIP   = flag.String("intercept-ip", "", "IP returned for intercepted A queries. Defaults to the host portion of --base-url.")
+		legacyCC  = flag.String("legacy-countries", "", "Comma-separated ISO country codes to source legacy-favorite fallbacks from (e.g. 'MD,RO'). Empty = global top-voted.")
+		legacyEx  = flag.String("legacy-exclude", "", "Comma-separated terms to exclude from legacy-favorite fallback (case-insensitive match against station name + tags). E.g. 'manele,gypsy'.")
+		legacySt  = flag.String("legacy-stations", "", "Pipe-separated explicit station names to use as the legacy-favorite pool (overrides --legacy-countries). E.g. 'Radio Moldova|Radio Moldova Tineret|Radio Moldova Muzical'.")
 		verbose   = flag.Bool("v", false, "Verbose logging.")
 	)
 	flag.Parse()
@@ -48,9 +51,12 @@ func main() {
 	httpSrv := &http.Server{
 		Addr: *httpAddr,
 		Handler: (&vtuner.Server{
-			BaseURL: resolvedBaseURL,
-			Logger:  logger,
-			Radio:   radiobrowser.NewClient(userAgent),
+			BaseURL:            resolvedBaseURL,
+			Logger:             logger,
+			Radio:              radiobrowser.NewClient(userAgent),
+			LegacyStations:     splitOn("|", *legacySt),
+			LegacyCountries:    splitCSV(*legacyCC),
+			LegacyExcludeTerms: splitCSV(*legacyEx),
 		}).Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
@@ -104,7 +110,13 @@ func main() {
 }
 
 func splitCSV(s string) []string {
-	parts := strings.Split(s, ",")
+	return splitOn(",", s)
+}
+
+// splitOn handles a custom separator so station names containing commas
+// ("Radio, Free Bucharest") survive intact when listed with a pipe.
+func splitOn(sep, s string) []string {
+	parts := strings.Split(s, sep)
 	out := parts[:0]
 	for _, p := range parts {
 		if p = strings.TrimSpace(p); p != "" {

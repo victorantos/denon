@@ -16,12 +16,17 @@
 #   BASE_URL=http://192.168.1.10 ./install.sh    pin the LAN IP explicitly
 #   VERSION=v0.1.0 ./install.sh                  pick a specific release
 #   REPO=fork/denon ./install.sh                 download from a fork
+#   LEGACY_COUNTRIES=MD,RO ./install.sh          source legacy-favorite fallbacks
+#                                                from specific countries (ISO codes)
 
 set -eu
 
 REPO=${REPO:-victorantos/denon}
 VERSION=${VERSION:-latest}
 BASE_URL=${BASE_URL:-}
+LEGACY_COUNTRIES=${LEGACY_COUNTRIES:-}
+LEGACY_EXCLUDE=${LEGACY_EXCLUDE:-}
+LEGACY_STATIONS=${LEGACY_STATIONS:-}
 LABEL=com.denon.tuner
 BIN=/usr/local/bin/denon
 SYSTEMD_UNIT=/etc/systemd/system/denon.service
@@ -89,6 +94,19 @@ require_cmd() {
 }
 
 install_launchd() {
+    legacy_args=""
+    if [ -n "$LEGACY_STATIONS" ]; then
+        legacy_args="${legacy_args}    <string>-legacy-stations</string><string>${LEGACY_STATIONS}</string>
+"
+    fi
+    if [ -n "$LEGACY_COUNTRIES" ]; then
+        legacy_args="${legacy_args}    <string>-legacy-countries</string><string>${LEGACY_COUNTRIES}</string>
+"
+    fi
+    if [ -n "$LEGACY_EXCLUDE" ]; then
+        legacy_args="${legacy_args}    <string>-legacy-exclude</string><string>${LEGACY_EXCLUDE}</string>
+"
+    fi
     sudo tee "$LAUNCHD_PLIST" >/dev/null <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -102,7 +120,7 @@ install_launchd() {
     <string>-dns</string><string>:53</string>
     <string>-base-url</string><string>${BASE_URL}</string>
     <string>-intercept-ip</string><string>${INTERCEPT_IP}</string>
-  </array>
+${legacy_args}  </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>/var/log/denon.out.log</string>
@@ -114,10 +132,38 @@ install_launchd() {
 EOF
     sudo chmod 644 "$LAUNCHD_PLIST"
     sudo launchctl bootout "system/$LABEL" 2>/dev/null || true
-    sudo launchctl bootstrap system "$LAUNCHD_PLIST"
+    # bootstrap occasionally returns "Input/output error" when launchd's
+    # internal state hasn't caught up after a fast bootout, or when the
+    # service label has been administratively disabled. Retry up to 3x with
+    # a sleep, and run `enable` between attempts to clear the disabled flag.
+    sleep 1
+    bootstrap_ok=0
+    attempt=1
+    while [ $attempt -le 3 ]; do
+        if sudo launchctl bootstrap system "$LAUNCHD_PLIST" 2>/dev/null; then
+            bootstrap_ok=1
+            break
+        fi
+        sudo launchctl enable "system/$LABEL" 2>/dev/null || true
+        sleep 2
+        attempt=$((attempt + 1))
+    done
+    if [ $bootstrap_ok -eq 0 ]; then
+        echo "warning: bootstrap failed after 3 attempts. To recover manually:" >&2
+        echo "  sudo launchctl enable system/$LABEL" >&2
+        echo "  sudo launchctl bootstrap system $LAUNCHD_PLIST" >&2
+        return 1
+    fi
 }
 
 install_systemd() {
+    extra_args=""
+    if [ -n "$LEGACY_COUNTRIES" ]; then
+        extra_args="${extra_args} -legacy-countries ${LEGACY_COUNTRIES}"
+    fi
+    if [ -n "$LEGACY_EXCLUDE" ]; then
+        extra_args="${extra_args} -legacy-exclude ${LEGACY_EXCLUDE}"
+    fi
     sudo tee "$SYSTEMD_UNIT" >/dev/null <<EOF
 [Unit]
 Description=denon — self-hosted vTuner replacement
@@ -126,7 +172,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${BIN} -http :80 -dns :53 -base-url ${BASE_URL} -intercept-ip ${INTERCEPT_IP}
+ExecStart=${BIN} -http :80 -dns :53 -base-url ${BASE_URL} -intercept-ip ${INTERCEPT_IP}${extra_args}
 Restart=on-failure
 RestartSec=5
 # Bind privileged ports without running as full root:

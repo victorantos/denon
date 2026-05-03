@@ -25,6 +25,23 @@ type Server struct {
 	Logger  *slog.Logger
 	Radio   *radiobrowser.Client
 
+	// LegacyStations is an explicit, ordered list of station names to use as
+	// the fallback pool. Each name is looked up via radio-browser search
+	// (top result wins). When set, this overrides LegacyCountries entirely —
+	// you get exactly the stations you asked for, hashed across favorites.
+	LegacyStations []string
+
+	// LegacyCountries narrows the fallback pool to specific country codes
+	// (ISO 3166-1 alpha-2). Empty = global top-voted. Ignored if
+	// LegacyStations is set.
+	LegacyCountries []string
+
+	// LegacyExcludeTerms drops any station whose tags or name (case-insensitive
+	// substring match) hits one of these. Useful when a country's "popular"
+	// list contains a genre you actively don't want. Applies to country/global
+	// pools; ignored when LegacyStations is set (you asked for those by name).
+	LegacyExcludeTerms []string
+
 	// Cache of HTTP-only popular stations used as legacy-favorite fallbacks.
 	// Each unique cached vTuner ID gets stably hashed into this list so the
 	// same Favorite always plays the same station, but different Favorites
@@ -109,22 +126,103 @@ func (s *Server) handleLegacyPlay(w http.ResponseWriter, r *http.Request) {
 	s.proxyStream(w, r, streamURL)
 }
 
-// legacyFallbacks returns a cached list of popular HTTP-only stations. We
-// prefer plain-HTTP because the receiver itself can't follow HTTPS; the
-// proxy works regardless, but HTTP-only is a tiny optimization. Cached for
-// an hour because mirror discovery and station refresh are not free.
+// legacyFallbacks returns a cached list of HTTP-only stations to back legacy
+// favorites. By default it pulls global top-voted; if LegacyCountries is set,
+// it pulls per-country popular stations and dedups by UUID. The proxy will
+// happily handle HTTPS upstreams too, but HTTP-only sources are a tiny win
+// (one fewer TLS handshake per station tap) so we filter when we can.
+// Cached for an hour because radio-browser mirror discovery isn't free.
 func (s *Server) legacyFallbacks(ctx context.Context) ([]radiobrowser.Station, error) {
 	s.legacyMu.Lock()
 	defer s.legacyMu.Unlock()
 	if len(s.legacyStations) > 0 && time.Now().Before(s.legacyExpires) {
 		return s.legacyStations, nil
 	}
-	stations, err := s.Radio.TopVote(ctx, 200)
-	if err != nil {
-		return nil, err
+
+	var stations []radiobrowser.Station
+
+	if len(s.LegacyStations) > 0 {
+		seen := map[string]bool{}
+		for _, name := range s.LegacyStations {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			results, err := s.Radio.Search(ctx, name, 10)
+			if err != nil {
+				s.Logger.Warn("legacy station search failed", "name", name, "err", err)
+				continue
+			}
+			if len(results) == 0 {
+				s.Logger.Warn("legacy station not found in radio-browser", "name", name)
+				continue
+			}
+			chosen, ok := pickBestMatch(name, results)
+			if !ok {
+				s.Logger.Warn("legacy station has only HLS streams (X3000-class receivers can't decode HLS)", "name", name)
+				continue
+			}
+			if seen[chosen.UUID] {
+				continue
+			}
+			seen[chosen.UUID] = true
+			stations = append(stations, chosen)
+		}
+		if len(stations) > 0 {
+			s.legacyStations = stations
+			s.legacyExpires = time.Now().Add(time.Hour)
+			names := make([]string, 0, len(stations))
+			for _, st := range stations {
+				names = append(names, st.Name)
+			}
+			s.Logger.Info("legacy fallback pool refreshed (explicit list)", "count", len(stations), "stations", names)
+			return stations, nil
+		}
+		s.Logger.Warn("legacy stations list yielded nothing — falling through to country/global")
 	}
+
+	if len(s.LegacyCountries) > 0 {
+		seen := map[string]bool{}
+		for _, cc := range s.LegacyCountries {
+			cc = strings.TrimSpace(cc)
+			if cc == "" {
+				continue
+			}
+			byCC, err := s.Radio.ByCountryCode(ctx, cc, 100)
+			if err != nil {
+				s.Logger.Warn("legacy country fetch failed", "cc", cc, "err", err)
+				continue
+			}
+			for _, st := range byCC {
+				if seen[st.UUID] {
+					continue
+				}
+				seen[st.UUID] = true
+				stations = append(stations, st)
+			}
+		}
+		// If every per-country call failed, fall through to global top so the
+		// receiver still hears music instead of bad-gateway errors.
+		if len(stations) == 0 {
+			global, err := s.Radio.TopVote(ctx, 200)
+			if err != nil {
+				return nil, err
+			}
+			stations = global
+		}
+	} else {
+		global, err := s.Radio.TopVote(ctx, 200)
+		if err != nil {
+			return nil, err
+		}
+		stations = global
+	}
+
 	httpOnly := make([]radiobrowser.Station, 0, len(stations))
 	for _, st := range stations {
+		if matchesExcluded(st, s.LegacyExcludeTerms) {
+			continue
+		}
 		u := st.URLResolved
 		if u == "" {
 			u = st.URL
@@ -134,11 +232,77 @@ func (s *Server) legacyFallbacks(ctx context.Context) ([]radiobrowser.Station, e
 		}
 	}
 	if len(httpOnly) == 0 {
-		httpOnly = stations
+		// Don't fall through to "all stations" if exclusion zeroed us out;
+		// repeat the exclude pass on the full set so the user's filter holds.
+		for _, st := range stations {
+			if matchesExcluded(st, s.LegacyExcludeTerms) {
+				continue
+			}
+			httpOnly = append(httpOnly, st)
+		}
 	}
 	s.legacyStations = httpOnly
 	s.legacyExpires = time.Now().Add(time.Hour)
+	s.Logger.Info("legacy fallback pool refreshed",
+		"count", len(s.legacyStations),
+		"countries", s.LegacyCountries,
+		"excluded_terms", s.LegacyExcludeTerms)
 	return httpOnly, nil
+}
+
+// pickBestMatch picks the best radio-browser hit for a user-supplied station
+// name. Exact-name matches beat prefix matches beat substring matches.
+// Within a tier, non-HLS URLs are strongly preferred (a large score penalty
+// for HLS) because older AVRs can't decode HLS at all. Returns ok=false if
+// every candidate is HLS-only.
+func pickBestMatch(query string, results []radiobrowser.Station) (radiobrowser.Station, bool) {
+	qLower := strings.ToLower(strings.TrimSpace(query))
+	var best radiobrowser.Station
+	bestScore := -1
+	for _, st := range results {
+		nameLower := strings.ToLower(st.Name)
+		score := 0
+		switch {
+		case nameLower == qLower:
+			score = 1000
+		case strings.HasPrefix(nameLower, qLower):
+			score = 500
+		case strings.Contains(nameLower, qLower):
+			score = 100
+		}
+		u := st.URLResolved
+		if u == "" {
+			u = st.URL
+		}
+		if strings.Contains(strings.ToLower(u), ".m3u8") {
+			score -= 10000
+		}
+		if score > bestScore {
+			bestScore = score
+			best = st
+		}
+	}
+	if bestScore < 0 {
+		return radiobrowser.Station{}, false
+	}
+	return best, true
+}
+
+func matchesExcluded(st radiobrowser.Station, terms []string) bool {
+	if len(terms) == 0 {
+		return false
+	}
+	haystack := strings.ToLower(st.Tags + " " + st.Name)
+	for _, t := range terms {
+		t = strings.TrimSpace(strings.ToLower(t))
+		if t == "" {
+			continue
+		}
+		if strings.Contains(haystack, t) {
+			return true
+		}
+	}
+	return false
 }
 
 // stableIdx maps an arbitrary string to [0,n) deterministically — same input
